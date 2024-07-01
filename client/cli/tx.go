@@ -1,215 +1,338 @@
-package cli
+package poa
 
 import (
-	"bufio"
 	"fmt"
 
-	"github.com/spf13/cobra"
-
-	"github.com/cosmos/cosmos-sdk/client"
-	"github.com/cosmos/cosmos-sdk/client/context"
-	"github.com/cosmos/cosmos-sdk/client/flags"
-	"github.com/cosmos/cosmos-sdk/codec"
 	sdk "github.com/cosmos/cosmos-sdk/types"
-	"github.com/cosmos/cosmos-sdk/x/auth"
-	"github.com/cosmos/cosmos-sdk/x/auth/client/utils"
+	sdkerrors "github.com/cosmos/cosmos-sdk/types/errors"
+	"github.com/ltacker/poa/keeper"
 	"github.com/ltacker/poa/types"
 )
 
-// GetTxCmd returns the transaction commands for this module
-func GetTxCmd(cdc *codec.Codec) *cobra.Command {
-	poaTxCmd := &cobra.Command{
-		Use:                        types.ModuleName,
-		Short:                      fmt.Sprintf("%s transactions subcommands", types.ModuleName),
-		DisableFlagParsing:         true,
-		SuggestionsMinimumDistance: 2,
-		RunE:                       client.ValidateCmd,
-	}
-
-	poaTxCmd.AddCommand(flags.PostCommands(
-		GetCmdSubmitApplication(cdc),
-		GetCmdProposeKick(cdc),
-		GetCmdVoteApplication(cdc),
-	)...)
-
-	return poaTxCmd
-}
-
-// GetCmdSubmitApplication sends a new application to become a validator
-func GetCmdSubmitApplication(cdc *codec.Codec) *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "apply",
-		Short: "Apply to become a new validator in the network",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			cliCtx := context.NewCLIContext().WithCodec(cdc)
-			inBuf := bufio.NewReader(cmd.InOrStdin())
-			txBldr := auth.NewTxBuilderFromCLI(inBuf).WithTxEncoder(utils.GetTxEncoder(cdc))
-
-			// Operator address is the sender
-			accAddress := cliCtx.GetFromAddress()
-			if accAddress.Empty() {
-				return fmt.Errorf("Account address empty")
-			}
-
-			opAddress := sdk.ValAddress(accAddress)
-
-			// Consensus public key for the validator
-			pkStr, err := cmd.Flags().GetString(FlagPubKey)
-			if err != nil {
-				return fmt.Errorf("Cannot get pubkey flag: %v", err)
-			}
-			pk, err := sdk.GetPubKeyFromBech32(sdk.Bech32PubKeyTypeConsPub, pkStr)
-			if err != nil {
-				return fmt.Errorf("Cannot convert pubkey: %v", err)
-			}
-
-			// Description of the candidate
-			moniker, _ := cmd.Flags().GetString(FlagMoniker)
-			identity, _ := cmd.Flags().GetString(FlagIdentity)
-			website, _ := cmd.Flags().GetString(FlagWebsite)
-			security, _ := cmd.Flags().GetString(FlagSecurityContact)
-			details, _ := cmd.Flags().GetString(FlagDetails)
-			description := types.NewDescription(moniker, identity, website, security, details)
-
-			candidateValidator := types.NewValidator(opAddress, pk, description)
-
-			msg := types.NewMsgSubmitApplication(candidateValidator)
-			err = msg.ValidateBasic()
-			if err != nil {
-				return err
-			}
-
-			return utils.GenerateOrBroadcastMsgs(cliCtx, txBldr, []sdk.Msg{msg})
-		},
-	}
-
-	cmd.Flags().AddFlagSet(FlagSetDescriptionCreate())
-	cmd.Flags().AddFlagSet(FlagSetPubKey())
-	_ = cmd.MarkFlagRequired(FlagPubKey)
-
-	return cmd
-}
-
-// GetCmdSubmitApplication sends a new application to become a validator
-func GetCmdProposeKick(cdc *codec.Codec) *cobra.Command {
-	return &cobra.Command{
-		Use:   "propose-kick [validator-addr]",
-		Short: "Propose to kick a validator from the validator",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			cliCtx := context.NewCLIContext().WithCodec(cdc)
-			inBuf := bufio.NewReader(cmd.InOrStdin())
-			txBldr := auth.NewTxBuilderFromCLI(inBuf).WithTxEncoder(utils.GetTxEncoder(cdc))
-
-			// Proposer address is the sender
-			accAddress := cliCtx.GetFromAddress()
-			if accAddress.Empty() {
-				return fmt.Errorf("Account address empty")
-			}
-			proposeAddress := sdk.ValAddress(accAddress)
-
-			// Get candidate address
-			candidateAddr, err := sdk.ValAddressFromBech32(args[0])
-			if err != nil {
-				return err
-			}
-
-			msg := types.NewMsgProposeKick(candidateAddr, proposeAddress)
-			err = msg.ValidateBasic()
-			if err != nil {
-				return err
-			}
-
-			return utils.GenerateOrBroadcastMsgs(cliCtx, txBldr, []sdk.Msg{msg})
-		},
+// NewHandler creates an sdk.Handler for all the poa type messages
+func NewHandler(k keeper.Keeper) sdk.Handler {
+	return func(ctx sdk.Context, msg sdk.Msg) (*sdk.Result, error) {
+		ctx = ctx.WithEventManager(sdk.NewEventManager())
+		switch msg := msg.(type) {
+		case types.MsgSubmitApplication:
+			return handleMsgSubmitApplication(ctx, k, msg)
+		case types.MsgVote:
+			return handleMsgVote(ctx, k, msg)
+		case types.MsgProposeKick:
+			return handleMsgProposeKick(ctx, k, msg)
+		default:
+			errMsg := fmt.Sprintf("unrecognized %s message type: %T", types.ModuleName, msg)
+			return nil, sdkerrors.Wrap(sdkerrors.ErrUnknownRequest, errMsg)
+		}
 	}
 }
 
-// GetCmdVoteApplication approves or rejects an application to become validator
-func GetCmdVoteApplication(cdc *codec.Codec) *cobra.Command {
-	return &cobra.Command{
-		Use:   "vote-application [candidate-addr] approve|reject",
-		Short: "Approve or reject the application to become a validator",
-		Args:  cobra.ExactArgs(2),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			cliCtx := context.NewCLIContext().WithCodec(cdc)
-			inBuf := bufio.NewReader(cmd.InOrStdin())
-			txBldr := auth.NewTxBuilderFromCLI(inBuf).WithTxEncoder(utils.GetTxEncoder(cdc))
+// handleMsgSubmitApplication create a new application to become a validator
+func handleMsgSubmitApplication(ctx sdk.Context, k keeper.Keeper, msg types.MsgSubmitApplication) (*sdk.Result, error) {
+	// Check max validator is not reached
+	allValidators := k.GetAllValidators(ctx)
+	maxValidator := k.MaxValidators(ctx)
+	if uint16(len(allValidators)) == maxValidator {
+		return nil, types.ErrMaxValidatorsReached
+	}
+	// Candidate should not be a validator
+	_, found := k.GetValidator(ctx, msg.Candidate.GetOperator())
+	if found {
+		return nil, types.ErrAlreadyValidator
+	}
+	_, found = k.GetValidatorByConsAddr(ctx, msg.Candidate.GetConsAddr())
+	if found {
+		return nil, types.ErrAlreadyValidator
+	}
 
-			// Voter address is the sender
-			accAddress := cliCtx.GetFromAddress()
-			if accAddress.Empty() {
-				return fmt.Errorf("Account address empty")
-			}
-			voterAddress := sdk.ValAddress(accAddress)
+	// If quorum is 0 the application is immediately approved
+	if k.Quorum(ctx) == 0 {
+		// The validator is directly appended in the validator set
+		k.AppendValidator(ctx, msg.Candidate)
 
-			// Get candidate address
-			valAddr, err := sdk.ValAddressFromBech32(args[0])
-			if err != nil {
-				return err
-			}
+		ctx.EventManager().EmitEvent(
+			sdk.NewEvent(
+				types.EventTypeAppendValidator,
+				sdk.NewAttribute(sdk.AttributeKeyModule, types.AttributeValueCategory),
+				sdk.NewAttribute(types.AttributeKeyCandidate, msg.Candidate.GetOperator().String()),
+			),
+		)
+	} else {
+		// If quorum is more than 0, we create a application vote
 
-			// Check if approved or rejected
-			var approved bool
-			if args[1] == "approve" {
-				approved = true
-			} else if args[1] == "reject" {
-				approved = false
-			} else {
-				return fmt.Errorf("Vote neither approved nor rejected")
-			}
+		// Candidate should not be already applying
+		_, found = k.GetApplication(ctx, msg.Candidate.GetOperator())
+		if found {
+			return nil, types.ErrAlreadyApplying
+		}
+		_, found = k.GetApplicationByConsAddr(ctx, msg.Candidate.GetConsAddr())
+		if found {
+			return nil, types.ErrAlreadyApplying
+		}
 
-			msg := types.NewMsgVote(types.VoteTypeApplication, voterAddress, valAddr, approved)
-			err = msg.ValidateBasic()
-			if err != nil {
-				return err
-			}
+		// Create the new application
+		k.AppendApplication(ctx, msg.Candidate)
 
-			return utils.GenerateOrBroadcastMsgs(cliCtx, txBldr, []sdk.Msg{msg})
-		},
+		ctx.EventManager().EmitEvent(
+			sdk.NewEvent(
+				types.EventTypeSubmitApplication,
+				sdk.NewAttribute(sdk.AttributeKeyModule, types.AttributeValueCategory),
+				sdk.NewAttribute(types.AttributeKeyCandidate, msg.Candidate.GetOperator().String()),
+			),
+		)
+	}
+
+	return &sdk.Result{Events: ctx.EventManager().Events()}, nil
+}
+
+// handleMsgProposeKick creates a new vote in the kick proposal pools if all conditions are met
+func handleMsgProposeKick(ctx sdk.Context, k keeper.Keeper, msg types.MsgProposeKick) (*sdk.Result, error) {
+	// The proposer must be a validator
+	_, found := k.GetValidator(ctx, msg.ProposerAddr)
+	if !found {
+		return nil, types.ErrProposerNotValidator
+	}
+
+	// Candidate should be a validator
+	candidate, found := k.GetValidator(ctx, msg.CandidateAddr)
+	if !found {
+		return nil, types.ErrNotValidator
+	}
+	// Can't create a kick proposal if the candidate is leaving the validator set
+	valState, found := k.GetValidatorState(ctx, msg.CandidateAddr)
+	if !found {
+		panic("A validator has no state")
+	}
+	if valState == types.ValidatorStateLeaving {
+		return nil, types.ErrValidatorLeaving
+	}
+
+	// If quorum is 0 the candidate is immediatelly kicked from the validator set
+	if k.Quorum(ctx) == 0 {
+		// We set the validator state to leaving, the End Blocker will update the keeper
+		k.SetValidatorState(ctx, candidate, types.ValidatorStateLeaving)
+
+		ctx.EventManager().EmitEvent(
+			sdk.NewEvent(
+				types.EventTypeKickValidator,
+				sdk.NewAttribute(sdk.AttributeKeyModule, types.AttributeValueCategory),
+				sdk.NewAttribute(types.AttributeKeyValidator, msg.CandidateAddr.String()),
+			),
+		)
+	} else {
+		// If quorum is more than 0, we create a kick proposal vote
+
+		// Candidate should not be already in a kick proposal
+		_, found = k.GetKickProposal(ctx, msg.CandidateAddr)
+		if found {
+			return nil, types.ErrAlreadyInKickProposal
+		}
+
+		// Create the new application
+		k.AppendKickProposal(ctx, candidate)
+
+		ctx.EventManager().EmitEvent(
+			sdk.NewEvent(
+				types.EventTypeProposeKick,
+				sdk.NewAttribute(sdk.AttributeKeyModule, types.AttributeValueCategory),
+				sdk.NewAttribute(types.AttributeKeyValidator, msg.CandidateAddr.String()),
+				sdk.NewAttribute(types.AttributeKeyProposer, msg.ProposerAddr.String()),
+			),
+		)
+	}
+
+	return &sdk.Result{Events: ctx.EventManager().Events()}, nil
+}
+
+// handleMsgVote handles a vote performed by a validator
+func handleMsgVote(ctx sdk.Context, k keeper.Keeper, msg types.MsgVote) (*sdk.Result, error) {
+	switch msg.VoteType {
+	case types.VoteTypeApplication:
+		return handleMsgVoteApplication(ctx, k, msg)
+	case types.VoteTypeKickProposal:
+		return handleMsgVoteTypeKickProposal(ctx, k, msg)
+	default:
+		return nil, types.ErrInvalidVoteMsg
 	}
 }
 
-// GetCmdVoteKickProposal approves or rejects a kick proposal
-func GetCmdVoteKickProposal(cdc *codec.Codec) *cobra.Command {
-	return &cobra.Command{
-		Use:   "vote-kick-proposal [candidate-addr] approve|reject",
-		Short: "Approve or reject a kick proposal to remove a validator",
-		Args:  cobra.ExactArgs(2),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			cliCtx := context.NewCLIContext().WithCodec(cdc)
-			inBuf := bufio.NewReader(cmd.InOrStdin())
-			txBldr := auth.NewTxBuilderFromCLI(inBuf).WithTxEncoder(utils.GetTxEncoder(cdc))
-
-			// Voter address is the sender
-			accAddress := cliCtx.GetFromAddress()
-			if accAddress.Empty() {
-				return fmt.Errorf("Account address empty")
-			}
-			voterAddress := sdk.ValAddress(accAddress)
-
-			// Get candidate address
-			valAddr, err := sdk.ValAddressFromBech32(args[0])
-			if err != nil {
-				return err
-			}
-
-			// Check if approved or rejected
-			var approved bool
-			if args[1] == "approve" {
-				approved = true
-			} else if args[1] == "reject" {
-				approved = false
-			} else {
-				return fmt.Errorf("Vote neither approved nor rejected")
-			}
-
-			msg := types.NewMsgVote(types.VoteTypeKickProposal, voterAddress, valAddr, approved)
-			err = msg.ValidateBasic()
-			if err != nil {
-				return err
-			}
-
-			return utils.GenerateOrBroadcastMsgs(cliCtx, txBldr, []sdk.Msg{msg})
-		},
+func handleMsgVoteApplication(ctx sdk.Context, k keeper.Keeper, msg types.MsgVote) (*sdk.Result, error) {
+	// Check max validator is not reached. If max validator is reached, not application can be voted
+	allValidators := k.GetAllValidators(ctx)
+	validatorCount := len(allValidators)
+	maxValidator := k.MaxValidators(ctx)
+	if uint16(validatorCount) == maxValidator {
+		return nil, types.ErrMaxValidatorsReached
 	}
+
+	// The voter must be a validator
+	_, found := k.GetValidator(ctx, msg.VoterAddr)
+	if !found {
+		return nil, types.ErrVoterNotValidator
+	}
+
+	// Check the application exist
+	application, found := k.GetApplication(ctx, msg.CandidateAddr)
+	if !found {
+		return nil, types.ErrNoApplicationFound
+	}
+
+	// Check if already voted and vote
+	alreadyVoted := application.AddVote(msg.VoterAddr, msg.Approve)
+	if alreadyVoted {
+		return nil, types.ErrAlreadyVoted
+	}
+
+	// Emit the vote event
+	if msg.Approve {
+		ctx.EventManager().EmitEvent(
+			sdk.NewEvent(
+				types.EventTypeApproveApplication,
+				sdk.NewAttribute(sdk.AttributeKeyModule, types.AttributeValueCategory),
+				sdk.NewAttribute(types.AttributeKeyVoter, msg.VoterAddr.String()),
+				sdk.NewAttribute(types.AttributeKeyCandidate, msg.CandidateAddr.String()),
+			),
+		)
+	} else {
+		ctx.EventManager().EmitEvent(
+			sdk.NewEvent(
+				types.EventTypeRejectApplication,
+				sdk.NewAttribute(sdk.AttributeKeyModule, types.AttributeValueCategory),
+				sdk.NewAttribute(types.AttributeKeyVoter, msg.VoterAddr.String()),
+				sdk.NewAttribute(types.AttributeKeyCandidate, msg.CandidateAddr.String()),
+			),
+		)
+	}
+
+	// Check if the quorum has been reached
+	reached, approved, err := application.CheckQuorum(uint64(validatorCount), uint64(k.Quorum(ctx)))
+	if err != nil {
+		return nil, err
+	}
+
+	if reached {
+		if approved {
+			// Candidate is appended to the validator set
+			k.RemoveApplication(ctx, msg.CandidateAddr)
+			k.AppendValidator(ctx, application.GetSubject())
+
+			// Emit approved event
+			ctx.EventManager().EmitEvent(
+				sdk.NewEvent(
+					types.EventTypeAppendValidator,
+					sdk.NewAttribute(sdk.AttributeKeyModule, types.AttributeValueCategory),
+					sdk.NewAttribute(types.AttributeKeyCandidate, msg.CandidateAddr.String()),
+				),
+			)
+		} else {
+			// Candidate is rejected from joining the validator set
+			k.RemoveApplication(ctx, msg.CandidateAddr)
+
+			// Emit rejected event
+			ctx.EventManager().EmitEvent(
+				sdk.NewEvent(
+					types.EventTypeRejectValidator,
+					sdk.NewAttribute(sdk.AttributeKeyModule, types.AttributeValueCategory),
+					sdk.NewAttribute(types.AttributeKeyCandidate, msg.CandidateAddr.String()),
+				),
+			)
+		}
+	} else {
+		// Quorum has not been reached yet, update the vote
+		k.SetApplication(ctx, application)
+	}
+
+	return &sdk.Result{Events: ctx.EventManager().Events()}, nil
+}
+
+func handleMsgVoteTypeKickProposal(ctx sdk.Context, k keeper.Keeper, msg types.MsgVote) (*sdk.Result, error) {
+	// The candidate of the kick proposal can't be the voter
+	if msg.VoterAddr.Equals(msg.CandidateAddr) {
+		return nil, types.ErrVoterIsCandidate
+	}
+
+	// The voter must be a validator
+	_, found := k.GetValidator(ctx, msg.VoterAddr)
+	if !found {
+		return nil, types.ErrVoterNotValidator
+	}
+
+	// Check the kick proposal exist
+	kickProposal, found := k.GetKickProposal(ctx, msg.CandidateAddr)
+	if !found {
+		return nil, types.ErrNoKickProposalFound
+	}
+
+	// Check if already voted and vote
+	alreadyVoted := kickProposal.AddVote(msg.VoterAddr, msg.Approve)
+	if alreadyVoted {
+		return nil, types.ErrAlreadyVoted
+	}
+
+	// Emit the vote event
+	if msg.Approve {
+		ctx.EventManager().EmitEvent(
+			sdk.NewEvent(
+				types.EventTypeApproveKickProposal,
+				sdk.NewAttribute(sdk.AttributeKeyModule, types.AttributeValueCategory),
+				sdk.NewAttribute(types.AttributeKeyVoter, msg.VoterAddr.String()),
+				sdk.NewAttribute(types.AttributeKeyValidator, msg.CandidateAddr.String()),
+			),
+		)
+	} else {
+		ctx.EventManager().EmitEvent(
+			sdk.NewEvent(
+				types.EventTypeRejectKickProposal,
+				sdk.NewAttribute(sdk.AttributeKeyModule, types.AttributeValueCategory),
+				sdk.NewAttribute(types.AttributeKeyVoter, msg.VoterAddr.String()),
+				sdk.NewAttribute(types.AttributeKeyValidator, msg.CandidateAddr.String()),
+			),
+		)
+	}
+
+	// Get validator count
+	allValidators := k.GetAllValidators(ctx)
+	validatorCount := len(allValidators)
+
+	// Check if the quorum has been reached
+	// We decrement validator count, the candidate of the kick proposal cannot vote
+	reached, approved, err := kickProposal.CheckQuorum(uint64(validatorCount)-1, uint64(k.Quorum(ctx)))
+	if err != nil {
+		return nil, err
+	}
+
+	if reached {
+		if approved {
+			// The validator leave the validator set
+			// The state is set to leave, End Blocker will remove definitely the validator
+			k.RemoveKickProposal(ctx, msg.CandidateAddr)
+			k.SetValidatorState(ctx, kickProposal.GetSubject(), types.ValidatorStateLeaving)
+
+			// Emit approved event
+			ctx.EventManager().EmitEvent(
+				sdk.NewEvent(
+					types.EventTypeKickValidator,
+					sdk.NewAttribute(sdk.AttributeKeyModule, types.AttributeValueCategory),
+					sdk.NewAttribute(types.AttributeKeyValidator, msg.CandidateAddr.String()),
+				),
+			)
+		} else {
+			// Kick proposal rejected, validator is not removed
+			k.RemoveKickProposal(ctx, msg.CandidateAddr)
+
+			// Emit rejected event
+			ctx.EventManager().EmitEvent(
+				sdk.NewEvent(
+					types.EventTypeKeepValidator,
+					sdk.NewAttribute(sdk.AttributeKeyModule, types.AttributeValueCategory),
+					sdk.NewAttribute(types.AttributeKeyValidator, msg.CandidateAddr.String()),
+				),
+			)
+		}
+	} else {
+		// Quorum has not been reached yet, update the vote
+		k.SetKickProposal(ctx, kickProposal)
+	}
+
+	return &sdk.Result{Events: ctx.EventManager().Events()}, nil
 }
