@@ -1,391 +1,338 @@
-package poa_test
+package poa
 
 import (
-	"testing"
+	"fmt"
 
-	"github.com/ltacker/poa"
+	sdk "github.com/cosmos/cosmos-sdk/types"
+	sdkerrors "github.com/cosmos/cosmos-sdk/types/errors"
+	"github.com/ltacker/poa/keeper"
 	"github.com/ltacker/poa/types"
 )
 
-func TestHandleMsgSubmitApplication(t *testing.T) {
-	// Test with maxValidator=15, quorum=66
-	ctx, poaKeeper := poa.MockContext()
-	handler := poa.NewHandler(poaKeeper)
-	validator, _ := poa.MockValidator()
-	poaKeeper.SetParams(ctx, types.DefaultParams())
-
-	// The application is submitted correctly
-	msg := types.NewMsgSubmitApplication(validator)
-	_, err := handler(ctx, msg)
-	if err != nil {
-		t.Errorf("MsgSubmitApplication should submit an application, got error %v", err)
-	}
-	_, found := poaKeeper.GetApplication(ctx, validator.GetOperator())
-	if !found {
-		t.Errorf("MsgSubmitApplication should submit an application, the application has not been found")
-	}
-	_, found = poaKeeper.GetApplicationByConsAddr(ctx, validator.GetConsAddr())
-	if !found {
-		t.Errorf("MsgSubmitApplication should submit an application, the application has not been found by cons addr")
-	}
-
-	// A new application with the same validator cannot be created
-	_, err = handler(ctx, msg)
-	if err.Error() != types.ErrAlreadyApplying.Error() {
-		t.Errorf("MsgSubmitApplication with duplicate, error should be %v, got %v", types.ErrAlreadyApplying.Error(), err.Error())
-	}
-
-	// Test with quorum=0
-	ctx, poaKeeper = poa.MockContext()
-	handler = poa.NewHandler(poaKeeper)
-	validator, _ = poa.MockValidator()
-	poaKeeper.SetParams(ctx, types.NewParams(15, 0))
-
-	// The validator should be directly appended if the quorum is 0
-	msg = types.NewMsgSubmitApplication(validator)
-	_, err = handler(ctx, msg)
-	if err != nil {
-		t.Errorf("MsgSubmitApplication with quorum 0 should append validator, got error %v", err)
-	}
-	_, found = poaKeeper.GetValidator(ctx, validator.GetOperator())
-	if !found {
-		t.Errorf("MsgSubmitApplication with quorum 0 should append validator, the validator has not been found")
-	}
-	_, found = poaKeeper.GetValidatorByConsAddr(ctx, validator.GetConsAddr())
-	if !found {
-		t.Errorf("MsgSubmitApplication with quorum 0 should append validator, the validator has not been found by cons addr")
-	}
-	foundState, found := poaKeeper.GetValidatorState(ctx, validator.GetOperator())
-	if !found {
-		t.Errorf("MsgSubmitApplication with quorum 0 should append validator, the validator state has not been found")
-	}
-	if foundState != types.ValidatorStateJoining {
-		t.Errorf("MsgSubmitApplication with quorum 0, the validator should have the state joining, if it is appended")
-	}
-
-	// A new application cannot be created if the validator already exist
-	_, err = handler(ctx, msg)
-	if err.Error() != types.ErrAlreadyValidator.Error() {
-		t.Errorf("MsgSubmitApplication with duplicate, error should be %v, got %v", types.ErrAlreadyValidator.Error(), err.Error())
-	}
-
-	// Test max validators condition
-	poaKeeper.SetParams(ctx, types.NewParams(1, 0))
-	_, err = handler(ctx, msg)
-	if err.Error() != types.ErrMaxValidatorsReached.Error() {
-		t.Errorf("MsgSubmitApplication with max validators reached, error should be %v, got %v", types.ErrMaxValidatorsReached.Error(), err.Error())
+// NewHandler creates an sdk.Handler for all the poa type messages
+func NewHandler(k keeper.Keeper) sdk.Handler {
+	return func(ctx sdk.Context, msg sdk.Msg) (*sdk.Result, error) {
+		ctx = ctx.WithEventManager(sdk.NewEventManager())
+		switch msg := msg.(type) {
+		case types.MsgSubmitApplication:
+			return handleMsgSubmitApplication(ctx, k, msg)
+		case types.MsgVote:
+			return handleMsgVote(ctx, k, msg)
+		case types.MsgProposeKick:
+			return handleMsgProposeKick(ctx, k, msg)
+		default:
+			errMsg := fmt.Sprintf("unrecognized %s message type: %T", types.ModuleName, msg)
+			return nil, sdkerrors.Wrap(sdkerrors.ErrUnknownRequest, errMsg)
+		}
 	}
 }
 
-func TestHandleMsgProposeKick(t *testing.T) {
-	// Test with maxValidator=15, quorum=66
-	ctx, poaKeeper := poa.MockContext()
-	handler := poa.NewHandler(poaKeeper)
-	validator1, _ := poa.MockValidator()
-	validator2, _ := poa.MockValidator()
-	nothing, _ := poa.MockValidator()
-	poaKeeper.SetParams(ctx, types.DefaultParams())
-
-	// Add validators to validator set
-	poaKeeper.AppendValidator(ctx, validator1)
-	poaKeeper.AppendValidator(ctx, validator2)
-
-	// Cannot propose to kick oneself
-	msg := types.NewMsgProposeKick(validator1.GetOperator(), validator1.GetOperator())
-	_, err := handler(ctx, msg)
-	if err.Error() != types.ErrProposerIsCandidate.Error() {
-		t.Errorf("MsgProposeKick with same address, error should be %v, got %v", types.ErrProposerIsCandidate.Error(), err.Error())
+// handleMsgSubmitApplication create a new application to become a validator
+func handleMsgSubmitApplication(ctx sdk.Context, k keeper.Keeper, msg types.MsgSubmitApplication) (*sdk.Result, error) {
+	// Check max validator is not reached
+	allValidators := k.GetAllValidators(ctx)
+	maxValidator := k.MaxValidators(ctx)
+	if uint16(len(allValidators)) == maxValidator {
+		return nil, types.ErrMaxValidatorsReached
+	}
+	// Candidate should not be a validator
+	_, found := k.GetValidator(ctx, msg.Candidate.GetOperator())
+	if found {
+		return nil, types.ErrAlreadyValidator
+	}
+	_, found = k.GetValidatorByConsAddr(ctx, msg.Candidate.GetConsAddr())
+	if found {
+		return nil, types.ErrAlreadyValidator
 	}
 
-	// The kick proposal is created correctly
-	msg = types.NewMsgProposeKick(validator1.GetOperator(), validator2.GetOperator())
-	_, err = handler(ctx, msg)
-	if err != nil {
-		t.Errorf("MsgProposeKick should create a kick proposal, got error %v", err)
+	// If quorum is 0 the application is immediately approved
+	if k.Quorum(ctx) == 0 {
+		// The validator is directly appended in the validator set
+		k.AppendValidator(ctx, msg.Candidate)
+
+		ctx.EventManager().EmitEvent(
+			sdk.NewEvent(
+				types.EventTypeAppendValidator,
+				sdk.NewAttribute(sdk.AttributeKeyModule, types.AttributeValueCategory),
+				sdk.NewAttribute(types.AttributeKeyCandidate, msg.Candidate.GetOperator().String()),
+			),
+		)
+	} else {
+		// If quorum is more than 0, we create a application vote
+
+		// Candidate should not be already applying
+		_, found = k.GetApplication(ctx, msg.Candidate.GetOperator())
+		if found {
+			return nil, types.ErrAlreadyApplying
+		}
+		_, found = k.GetApplicationByConsAddr(ctx, msg.Candidate.GetConsAddr())
+		if found {
+			return nil, types.ErrAlreadyApplying
+		}
+
+		// Create the new application
+		k.AppendApplication(ctx, msg.Candidate)
+
+		ctx.EventManager().EmitEvent(
+			sdk.NewEvent(
+				types.EventTypeSubmitApplication,
+				sdk.NewAttribute(sdk.AttributeKeyModule, types.AttributeValueCategory),
+				sdk.NewAttribute(types.AttributeKeyCandidate, msg.Candidate.GetOperator().String()),
+			),
+		)
 	}
-	_, found := poaKeeper.GetKickProposal(ctx, validator1.GetOperator())
+
+	return &sdk.Result{Events: ctx.EventManager().Events()}, nil
+}
+
+// handleMsgProposeKick creates a new vote in the kick proposal pools if all conditions are met
+func handleMsgProposeKick(ctx sdk.Context, k keeper.Keeper, msg types.MsgProposeKick) (*sdk.Result, error) {
+	// The proposer must be a validator
+	_, found := k.GetValidator(ctx, msg.ProposerAddr)
 	if !found {
-		t.Errorf("MsgProposeKick should create a kick proposal, the kick proposal has not been found")
+		return nil, types.ErrProposerNotValidator
 	}
 
-	// A new application with the same validator cannot be created
-	_, err = handler(ctx, msg)
-	if err.Error() != types.ErrAlreadyInKickProposal.Error() {
-		t.Errorf("MsgProposeKick with duplicate, error should be %v, got %v", types.ErrAlreadyInKickProposal.Error(), err.Error())
-	}
-
-	// A non validator cannot create a kick proposal
-	msg = types.NewMsgProposeKick(validator2.GetOperator(), nothing.GetOperator())
-	_, err = handler(ctx, msg)
-	if err.Error() != types.ErrProposerNotValidator.Error() {
-		t.Errorf("MsgProposeKick sent by a non validator, error should be %v, got %v", types.ErrProposerNotValidator.Error(), err.Error())
-	}
-
-	// A non validator cannot be proposed to be kicked
-	msg = types.NewMsgProposeKick(nothing.GetOperator(), validator2.GetOperator())
-	_, err = handler(ctx, msg)
-	if err.Error() != types.ErrNotValidator.Error() {
-		t.Errorf("MsgProposeKick propose a non validator, error should be %v, got %v", types.ErrNotValidator.Error(), err.Error())
-	}
-
-	// Test with quorum=0
-	ctx, poaKeeper = poa.MockContext()
-	handler = poa.NewHandler(poaKeeper)
-	validator1, _ = poa.MockValidator()
-	validator2, _ = poa.MockValidator()
-	poaKeeper.SetParams(ctx, types.NewParams(15, 0))
-
-	// Add validators to validator set
-	poaKeeper.AppendValidator(ctx, validator1)
-	poaKeeper.AppendValidator(ctx, validator2)
-
-	// The validator should be directly appended if the quorum is 0
-	msg = types.NewMsgProposeKick(validator1.GetOperator(), validator2.GetOperator())
-	_, err = handler(ctx, msg)
-	if err != nil {
-		t.Errorf("MsgProposeKick with quorum 0 should kick validator, got error %v", err)
-	}
-	// Check state is leaving
-	foundState, found := poaKeeper.GetValidatorState(ctx, validator1.GetOperator())
+	// Candidate should be a validator
+	candidate, found := k.GetValidator(ctx, msg.CandidateAddr)
 	if !found {
-		t.Errorf("MsgProposeKick with quorum 0 should not directly remove the validator from the validator set")
+		return nil, types.ErrNotValidator
 	}
-	if foundState != types.ValidatorStateLeaving {
-		t.Errorf("MsgProposeKick with quorum 0, the validator state should be leaving")
+	// Can't create a kick proposal if the candidate is leaving the validator set
+	valState, found := k.GetValidatorState(ctx, msg.CandidateAddr)
+	if !found {
+		panic("A validator has no state")
+	}
+	if valState == types.ValidatorStateLeaving {
+		return nil, types.ErrValidatorLeaving
+	}
+
+	// If quorum is 0 the candidate is immediatelly kicked from the validator set
+	if k.Quorum(ctx) == 0 {
+		// We set the validator state to leaving, the End Blocker will update the keeper
+		k.SetValidatorState(ctx, candidate, types.ValidatorStateLeaving)
+
+		ctx.EventManager().EmitEvent(
+			sdk.NewEvent(
+				types.EventTypeKickValidator,
+				sdk.NewAttribute(sdk.AttributeKeyModule, types.AttributeValueCategory),
+				sdk.NewAttribute(types.AttributeKeyValidator, msg.CandidateAddr.String()),
+			),
+		)
+	} else {
+		// If quorum is more than 0, we create a kick proposal vote
+
+		// Candidate should not be already in a kick proposal
+		_, found = k.GetKickProposal(ctx, msg.CandidateAddr)
+		if found {
+			return nil, types.ErrAlreadyInKickProposal
+		}
+
+		// Create the new application
+		k.AppendKickProposal(ctx, candidate)
+
+		ctx.EventManager().EmitEvent(
+			sdk.NewEvent(
+				types.EventTypeProposeKick,
+				sdk.NewAttribute(sdk.AttributeKeyModule, types.AttributeValueCategory),
+				sdk.NewAttribute(types.AttributeKeyValidator, msg.CandidateAddr.String()),
+				sdk.NewAttribute(types.AttributeKeyProposer, msg.ProposerAddr.String()),
+			),
+		)
+	}
+
+	return &sdk.Result{Events: ctx.EventManager().Events()}, nil
+}
+
+// handleMsgVote handles a vote performed by a validator
+func handleMsgVote(ctx sdk.Context, k keeper.Keeper, msg types.MsgVote) (*sdk.Result, error) {
+	switch msg.VoteType {
+	case types.VoteTypeApplication:
+		return handleMsgVoteApplication(ctx, k, msg)
+	case types.VoteTypeKickProposal:
+		return handleMsgVoteTypeKickProposal(ctx, k, msg)
+	default:
+		return nil, types.ErrInvalidVoteMsg
 	}
 }
 
-func TestHandleMsgVoteApplication(t *testing.T) {
-	ctx, poaKeeper := poa.MockContext()
-	handler := poa.NewHandler(poaKeeper)
-	voter1, _ := poa.MockValidator()
-	voter2, _ := poa.MockValidator()
-	candidate1, _ := poa.MockValidator()
-	candidate2, _ := poa.MockValidator()
-	nothing, _ := poa.MockValidator()
-	poaKeeper.SetParams(ctx, types.NewParams(15, 100)) // Set quorum to 100%
-
-	// Add voter to validator set
-	poaKeeper.AppendValidator(ctx, voter1)
-	poaKeeper.AppendValidator(ctx, voter2)
-
-	// Add candidate to application pool
-	poaKeeper.AppendApplication(ctx, candidate1)
-	poaKeeper.AppendApplication(ctx, candidate2)
-
-	// Cannot vote if candidate is not in application pool
-	msg := types.NewMsgVote(types.VoteTypeApplication, voter1.GetOperator(), nothing.GetOperator(), true)
-	_, err := handler(ctx, msg)
-	if err.Error() != types.ErrNoApplicationFound.Error() {
-		t.Errorf("MsgVoteApplication should fail with %v, got %v", types.ErrNoApplicationFound, err)
+func handleMsgVoteApplication(ctx sdk.Context, k keeper.Keeper, msg types.MsgVote) (*sdk.Result, error) {
+	// Check max validator is not reached. If max validator is reached, not application can be voted
+	allValidators := k.GetAllValidators(ctx)
+	validatorCount := len(allValidators)
+	maxValidator := k.MaxValidators(ctx)
+	if uint16(validatorCount) == maxValidator {
+		return nil, types.ErrMaxValidatorsReached
 	}
 
-	// Cannot vote if the voter is not in validator set
-	msg = types.NewMsgVote(types.VoteTypeApplication, nothing.GetOperator(), candidate1.GetOperator(), true)
-	_, err = handler(ctx, msg)
-	if err.Error() != types.ErrVoterNotValidator.Error() {
-		t.Errorf("MsgVoteApplication should fail with %v, got %v", types.ErrVoterNotValidator, err)
-	}
-
-	// Can vote an application
-	msg = types.NewMsgVote(types.VoteTypeApplication, voter1.GetOperator(), candidate1.GetOperator(), true)
-	_, err = handler(ctx, msg)
-	if err != nil {
-		t.Errorf("MsgVoteApplication should vote on an application, got error %v", err)
-	}
-	application, found := poaKeeper.GetApplication(ctx, candidate1.GetOperator())
+	// The voter must be a validator
+	_, found := k.GetValidator(ctx, msg.VoterAddr)
 	if !found {
-		t.Errorf("MsgVoteApplication with 1/2 approve should not remove the application")
-	}
-	_, found = poaKeeper.GetValidator(ctx, candidate1.GetOperator())
-	if found {
-		t.Errorf("MsgVoteApplication with 1/2 approve should not append the candidate to the validator set")
-	}
-	if application.GetTotal() != 1 {
-		t.Errorf("MsgVoteApplication with approve should add one vote to the application")
-	}
-	if application.GetApprovals() != 1 {
-		t.Errorf("MsgVoteApplication with approve should add one approve to the application")
+		return nil, types.ErrVoterNotValidator
 	}
 
-	// Second approve should append the candidate to the validator pool
-	msg = types.NewMsgVote(types.VoteTypeApplication, voter2.GetOperator(), candidate1.GetOperator(), true)
-	_, err = handler(ctx, msg)
-	if err != nil {
-		t.Errorf("MsgVoteApplication 2 should vote on an application, got error %v", err)
-	}
-	_, found = poaKeeper.GetApplication(ctx, candidate1.GetOperator())
-	if found {
-		t.Errorf("MsgVoteApplication with 2/2 approve should remove the application")
-	}
-	_, found = poaKeeper.GetValidator(ctx, candidate1.GetOperator())
+	// Check the application exist
+	application, found := k.GetApplication(ctx, msg.CandidateAddr)
 	if !found {
-		t.Errorf("MsgVoteApplication with 2/2 approve should append the candidate to the validator set")
+		return nil, types.ErrNoApplicationFound
 	}
 
-	// Quorum 100%: one reject is sufficient to reject the validator application
-	msg = types.NewMsgVote(types.VoteTypeApplication, voter1.GetOperator(), candidate2.GetOperator(), false)
-	_, err = handler(ctx, msg)
+	// Check if already voted and vote
+	alreadyVoted := application.AddVote(msg.VoterAddr, msg.Approve)
+	if alreadyVoted {
+		return nil, types.ErrAlreadyVoted
+	}
+
+	// Emit the vote event
+	if msg.Approve {
+		ctx.EventManager().EmitEvent(
+			sdk.NewEvent(
+				types.EventTypeApproveApplication,
+				sdk.NewAttribute(sdk.AttributeKeyModule, types.AttributeValueCategory),
+				sdk.NewAttribute(types.AttributeKeyVoter, msg.VoterAddr.String()),
+				sdk.NewAttribute(types.AttributeKeyCandidate, msg.CandidateAddr.String()),
+			),
+		)
+	} else {
+		ctx.EventManager().EmitEvent(
+			sdk.NewEvent(
+				types.EventTypeRejectApplication,
+				sdk.NewAttribute(sdk.AttributeKeyModule, types.AttributeValueCategory),
+				sdk.NewAttribute(types.AttributeKeyVoter, msg.VoterAddr.String()),
+				sdk.NewAttribute(types.AttributeKeyCandidate, msg.CandidateAddr.String()),
+			),
+		)
+	}
+
+	// Check if the quorum has been reached
+	reached, approved, err := application.CheckQuorum(uint64(validatorCount), uint64(k.Quorum(ctx)))
 	if err != nil {
-		t.Errorf("MsgVoteApplication 3 should vote on an application, got error %v", err)
-	}
-	_, found = poaKeeper.GetApplication(ctx, candidate2.GetOperator())
-	if found {
-		t.Errorf("MsgVoteApplication with 1 reject should reject the application")
-	}
-	_, found = poaKeeper.GetValidator(ctx, candidate2.GetOperator())
-	if found {
-		t.Errorf("MsgVoteApplication application rejected should not append the candidate to the validator set")
+		return nil, err
 	}
 
-	// Reapply and set quorum to 1%
-	poaKeeper.AppendApplication(ctx, candidate2)
-	poaKeeper.SetParams(ctx, types.NewParams(15, 1))
+	if reached {
+		if approved {
+			// Candidate is appended to the validator set
+			k.RemoveApplication(ctx, msg.CandidateAddr)
+			k.AppendValidator(ctx, application.GetSubject())
 
-	// One reject should update the vote but not reject totally the application
-	msg = types.NewMsgVote(types.VoteTypeApplication, voter1.GetOperator(), candidate2.GetOperator(), false)
-	_, err = handler(ctx, msg)
-	if err != nil {
-		t.Errorf("MsgVoteApplication 4 should vote on an application, got error %v", err)
-	}
-	application, found = poaKeeper.GetApplication(ctx, candidate2.GetOperator())
-	if !found {
-		t.Errorf("MsgVoteApplication with 1/3 reject should not remove the application")
-	}
-	_, found = poaKeeper.GetValidator(ctx, candidate2.GetOperator())
-	if found {
-		t.Errorf("MsgVoteApplication with 1/3 reject should not append the candidate to the validator set")
-	}
-	if application.GetTotal() != 1 {
-		t.Errorf("MsgVoteApplication with reject should add one vote to the application")
-	}
-	if application.GetApprovals() != 0 {
-		t.Errorf("MsgVoteApplication with reject should not add one approve to the application")
+			// Emit approved event
+			ctx.EventManager().EmitEvent(
+				sdk.NewEvent(
+					types.EventTypeAppendValidator,
+					sdk.NewAttribute(sdk.AttributeKeyModule, types.AttributeValueCategory),
+					sdk.NewAttribute(types.AttributeKeyCandidate, msg.CandidateAddr.String()),
+				),
+			)
+		} else {
+			// Candidate is rejected from joining the validator set
+			k.RemoveApplication(ctx, msg.CandidateAddr)
+
+			// Emit rejected event
+			ctx.EventManager().EmitEvent(
+				sdk.NewEvent(
+					types.EventTypeRejectValidator,
+					sdk.NewAttribute(sdk.AttributeKeyModule, types.AttributeValueCategory),
+					sdk.NewAttribute(types.AttributeKeyCandidate, msg.CandidateAddr.String()),
+				),
+			)
+		}
+	} else {
+		// Quorum has not been reached yet, update the vote
+		k.SetApplication(ctx, application)
 	}
 
-	// Cannot vote if validator set is full
-	poaKeeper.SetParams(ctx, types.NewParams(3, 1))
-
-	msg = types.NewMsgVote(types.VoteTypeApplication, voter2.GetOperator(), candidate2.GetOperator(), false)
-	_, err = handler(ctx, msg)
-	if err.Error() != types.ErrMaxValidatorsReached.Error() {
-		t.Errorf("MsgVoteApplication should fail with %v, got %v", types.ErrMaxValidatorsReached, err)
-	}
+	return &sdk.Result{Events: ctx.EventManager().Events()}, nil
 }
 
-func TestHandleMsgVoteKickProposal(t *testing.T) {
-	ctx, poaKeeper := poa.MockContext()
-	handler := poa.NewHandler(poaKeeper)
-	voter1, _ := poa.MockValidator()
-	voter2, _ := poa.MockValidator()
-	validator1, _ := poa.MockValidator()
-	poaKeeper.SetParams(ctx, types.NewParams(15, 100)) // Set quorum to 100%
-
-	// Add voter to validator set
-	poaKeeper.AppendValidator(ctx, voter1)
-	poaKeeper.AppendValidator(ctx, voter2)
-	poaKeeper.AppendValidator(ctx, validator1)
-
-	// Cannot vote if no kick proposal
-	msg := types.NewMsgVote(types.VoteTypeKickProposal, voter1.GetOperator(), validator1.GetOperator(), true)
-	_, err := handler(ctx, msg)
-	if err.Error() != types.ErrNoKickProposalFound.Error() {
-		t.Errorf("MsgVoteKickProposal with no kick proposal, error should be %v, got %v", types.ErrNoKickProposalFound.Error(), err.Error())
+func handleMsgVoteTypeKickProposal(ctx sdk.Context, k keeper.Keeper, msg types.MsgVote) (*sdk.Result, error) {
+	// The candidate of the kick proposal can't be the voter
+	if msg.VoterAddr.Equals(msg.CandidateAddr) {
+		return nil, types.ErrVoterIsCandidate
 	}
 
-	// Create a kick proposal
-	poaKeeper.AppendKickProposal(ctx, validator1)
-
-	// Cannot vote to kick oneself
-	msg = types.NewMsgVote(types.VoteTypeKickProposal, validator1.GetOperator(), validator1.GetOperator(), true)
-	_, err = handler(ctx, msg)
-	if err.Error() != types.ErrVoterIsCandidate.Error() {
-		t.Errorf("MsgVoteKickProposal with same address, error should be %v, got %v", types.ErrVoterIsCandidate.Error(), err.Error())
+	// The voter must be a validator
+	_, found := k.GetValidator(ctx, msg.VoterAddr)
+	if !found {
+		return nil, types.ErrVoterNotValidator
 	}
 
-	// Can vote a kick proposal
-	msg = types.NewMsgVote(types.VoteTypeKickProposal, voter1.GetOperator(), validator1.GetOperator(), true)
-	_, err = handler(ctx, msg)
+	// Check the kick proposal exist
+	kickProposal, found := k.GetKickProposal(ctx, msg.CandidateAddr)
+	if !found {
+		return nil, types.ErrNoKickProposalFound
+	}
+
+	// Check if already voted and vote
+	alreadyVoted := kickProposal.AddVote(msg.VoterAddr, msg.Approve)
+	if alreadyVoted {
+		return nil, types.ErrAlreadyVoted
+	}
+
+	// Emit the vote event
+	if msg.Approve {
+		ctx.EventManager().EmitEvent(
+			sdk.NewEvent(
+				types.EventTypeApproveKickProposal,
+				sdk.NewAttribute(sdk.AttributeKeyModule, types.AttributeValueCategory),
+				sdk.NewAttribute(types.AttributeKeyVoter, msg.VoterAddr.String()),
+				sdk.NewAttribute(types.AttributeKeyValidator, msg.CandidateAddr.String()),
+			),
+		)
+	} else {
+		ctx.EventManager().EmitEvent(
+			sdk.NewEvent(
+				types.EventTypeRejectKickProposal,
+				sdk.NewAttribute(sdk.AttributeKeyModule, types.AttributeValueCategory),
+				sdk.NewAttribute(types.AttributeKeyVoter, msg.VoterAddr.String()),
+				sdk.NewAttribute(types.AttributeKeyValidator, msg.CandidateAddr.String()),
+			),
+		)
+	}
+
+	// Get validator count
+	allValidators := k.GetAllValidators(ctx)
+	validatorCount := len(allValidators)
+
+	// Check if the quorum has been reached
+	// We decrement validator count, the candidate of the kick proposal cannot vote
+	reached, approved, err := kickProposal.CheckQuorum(uint64(validatorCount)-1, uint64(k.Quorum(ctx)))
 	if err != nil {
-		t.Errorf("MsgVoteKickProposal should vote on a kick proposal, got error %v", err)
-	}
-	_, found := poaKeeper.GetValidator(ctx, validator1.GetOperator())
-	if !found {
-		t.Errorf("MsgVoteKickProposal with 1/2 approve should not remove the validator")
-	}
-	kickProposal, found := poaKeeper.GetKickProposal(ctx, validator1.GetOperator())
-	if !found {
-		t.Errorf("MsgVoteKickProposal with 1/2 approve should not remove the kick proposal")
-	}
-	if kickProposal.GetTotal() != 1 {
-		t.Errorf("MsgVoteKickProposal with approve should add one vote to the kick proposal")
-	}
-	if kickProposal.GetApprovals() != 1 {
-		t.Errorf("MsgVoteKickProposal with approve should add one approve to the kick proposal")
+		return nil, err
 	}
 
-	// Second approve should set the set of the validator to leaving
-	msg = types.NewMsgVote(types.VoteTypeKickProposal, voter2.GetOperator(), validator1.GetOperator(), true)
-	_, err = handler(ctx, msg)
-	if err != nil {
-		t.Errorf("MsgVoteKickProposal 2 should vote on a kick proposal, got error %v", err)
-	}
-	_, found = poaKeeper.GetKickProposal(ctx, validator1.GetOperator())
-	if found {
-		t.Errorf("MsgVoteKickProposal with 2/2 approve should remove the kick proposal")
-	}
-	validatorState, found := poaKeeper.GetValidatorState(ctx, validator1.GetOperator())
-	if !found {
-		t.Errorf("MsgVoteKickProposal with 2/2 approve should not directly remove the validator from the validator set")
-	}
-	if validatorState != types.ValidatorStateLeaving {
-		t.Errorf("MsgVoteKickProposal with 2/2 approve should set the state of the validator to leaving")
+	if reached {
+		if approved {
+			// The validator leave the validator set
+			// The state is set to leave, End Blocker will remove definitely the validator
+			k.RemoveKickProposal(ctx, msg.CandidateAddr)
+			k.SetValidatorState(ctx, kickProposal.GetSubject(), types.ValidatorStateLeaving)
+
+			// Emit approved event
+			ctx.EventManager().EmitEvent(
+				sdk.NewEvent(
+					types.EventTypeKickValidator,
+					sdk.NewAttribute(sdk.AttributeKeyModule, types.AttributeValueCategory),
+					sdk.NewAttribute(types.AttributeKeyValidator, msg.CandidateAddr.String()),
+				),
+			)
+		} else {
+			// Kick proposal rejected, validator is not removed
+			k.RemoveKickProposal(ctx, msg.CandidateAddr)
+
+			// Emit rejected event
+			ctx.EventManager().EmitEvent(
+				sdk.NewEvent(
+					types.EventTypeKeepValidator,
+					sdk.NewAttribute(sdk.AttributeKeyModule, types.AttributeValueCategory),
+					sdk.NewAttribute(types.AttributeKeyValidator, msg.CandidateAddr.String()),
+				),
+			)
+		}
+	} else {
+		// Quorum has not been reached yet, update the vote
+		k.SetKickProposal(ctx, kickProposal)
 	}
 
-	// Quorum 100%: one reject is sufficient to reject the kick proposal
-	poaKeeper.AppendKickProposal(ctx, voter2)
-	msg = types.NewMsgVote(types.VoteTypeKickProposal, voter1.GetOperator(), voter2.GetOperator(), false)
-	_, err = handler(ctx, msg)
-	if err != nil {
-		t.Errorf("MsgVoteKickProposal 3 should vote on a kick proposal, got error %v", err)
-	}
-	_, found = poaKeeper.GetKickProposal(ctx, voter2.GetOperator())
-	if found {
-		t.Errorf("MsgVoteKickProposal with 1 reject should reject the kick proposal")
-	}
-	validatorState, found = poaKeeper.GetValidatorState(ctx, voter2.GetOperator())
-	if !found {
-		t.Errorf("MsgVoteKickProposal kick proposal rejected should not remove the validator")
-	}
-	if validatorState == types.ValidatorStateLeaving {
-		t.Errorf("MsgVoteKickProposal kick proposal rejected should not set the state of the validator to leaving")
-	}
-
-	// Reapply and set quorum to 1%
-	poaKeeper.AppendKickProposal(ctx, voter2)
-	poaKeeper.SetParams(ctx, types.NewParams(15, 1))
-
-	// One reject should update the vote but not reject totally the kick proposal
-	msg = types.NewMsgVote(types.VoteTypeKickProposal, voter1.GetOperator(), voter2.GetOperator(), false)
-	_, err = handler(ctx, msg)
-	if err != nil {
-		t.Errorf("MsgVoteKickProposal 4 should vote on a kick proposal, got error %v", err)
-	}
-	kickProposal, found = poaKeeper.GetKickProposal(ctx, voter2.GetOperator())
-	if !found {
-		t.Errorf("MsgVoteKickProposal with 1/2 reject should not remove the kick proposal")
-	}
-	_, found = poaKeeper.GetValidatorState(ctx, voter2.GetOperator())
-	if !found {
-		t.Errorf("MsgVoteKickProposal with 1/2 rejec should not remove the validator")
-	}
-	if validatorState == types.ValidatorStateLeaving {
-		t.Errorf("MsgVoteKickProposal with 1/2 rejec should not set the state of the validator to leaving")
-	}
-	if kickProposal.GetTotal() != 1 {
-		t.Errorf("MsgVoteKickProposal with 1/2 reject should add one vote to the kick proposal")
-	}
-	if kickProposal.GetApprovals() != 0 {
-		t.Errorf("MsgVoteKickProposal with 1/2 reject should not add one approve to the kick proposal")
-	}
+	return &sdk.Result{Events: ctx.EventManager().Events()}, nil
 }

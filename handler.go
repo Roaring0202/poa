@@ -87,11 +87,6 @@ func handleMsgSubmitApplication(ctx sdk.Context, k keeper.Keeper, msg types.MsgS
 
 // handleMsgProposeKick creates a new vote in the kick proposal pools if all conditions are met
 func handleMsgProposeKick(ctx sdk.Context, k keeper.Keeper, msg types.MsgProposeKick) (*sdk.Result, error) {
-	// The candidate of the kick proposal can't be the proposer
-	if msg.ProposerAddr.Equals(msg.CandidateAddr) {
-		return nil, types.ErrProposerIsCandidate
-	}
-
 	// The proposer must be a validator
 	_, found := k.GetValidator(ctx, msg.ProposerAddr)
 	if !found {
