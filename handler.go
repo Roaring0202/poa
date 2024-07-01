@@ -20,8 +20,6 @@ func NewHandler(k keeper.Keeper) sdk.Handler {
 			return handleMsgVote(ctx, k, msg)
 		case types.MsgProposeKick:
 			return handleMsgProposeKick(ctx, k, msg)
-		case types.MsgLeaveValidatorSet:
-			return handleMsgLeaveValidatorSet(ctx, k, msg)
 		default:
 			errMsg := fmt.Sprintf("unrecognized %s message type: %T", types.ModuleName, msg)
 			return nil, sdkerrors.Wrap(sdkerrors.ErrUnknownRequest, errMsg)
@@ -89,11 +87,6 @@ func handleMsgSubmitApplication(ctx sdk.Context, k keeper.Keeper, msg types.MsgS
 
 // handleMsgProposeKick creates a new vote in the kick proposal pools if all conditions are met
 func handleMsgProposeKick(ctx sdk.Context, k keeper.Keeper, msg types.MsgProposeKick) (*sdk.Result, error) {
-	// The candidate of the kick proposal can't be the proposer
-	if msg.ProposerAddr.Equals(msg.CandidateAddr) {
-		return nil, types.ErrProposerIsCandidate
-	}
-
 	// The proposer must be a validator
 	_, found := k.GetValidator(ctx, msg.ProposerAddr)
 	if !found {
@@ -340,41 +333,6 @@ func handleMsgVoteTypeKickProposal(ctx sdk.Context, k keeper.Keeper, msg types.M
 		// Quorum has not been reached yet, update the vote
 		k.SetKickProposal(ctx, kickProposal)
 	}
-
-	return &sdk.Result{Events: ctx.EventManager().Events()}, nil
-}
-
-func handleMsgLeaveValidatorSet(ctx sdk.Context, k keeper.Keeper, msg types.MsgLeaveValidatorSet) (*sdk.Result, error) {
-	// Sender must be a validator
-	validator, found := k.GetValidator(ctx, msg.ValidatorAddr)
-	if !found {
-		return nil, types.ErrNotValidator
-	}
-
-	// Get validator count
-	allValidators := k.GetAllValidators(ctx)
-	validatorCount := len(allValidators)
-	if validatorCount == 1 {
-		return nil, types.ErrOnlyOneValidator
-	}
-
-	// If a kick proposal exist for this validator, remove it
-	_, found = k.GetKickProposal(ctx, msg.ValidatorAddr)
-	if found {
-		k.RemoveKickProposal(ctx, msg.ValidatorAddr)
-	}
-
-	// Set the state of the validator to leaving, End Blocker will remove the validator from the keeper
-	k.SetValidatorState(ctx, validator, types.ValidatorStateLeaving)
-
-	// Emit approved event
-	ctx.EventManager().EmitEvent(
-		sdk.NewEvent(
-			types.EventTypeLeaveValidatorSet,
-			sdk.NewAttribute(sdk.AttributeKeyModule, types.AttributeValueCategory),
-			sdk.NewAttribute(types.AttributeKeyValidator, msg.ValidatorAddr.String()),
-		),
-	)
 
 	return &sdk.Result{Events: ctx.EventManager().Events()}, nil
 }
